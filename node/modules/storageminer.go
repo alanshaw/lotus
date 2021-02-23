@@ -62,6 +62,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/gen"
 	"github.com/filecoin-project/lotus/chain/gen/slashfilter"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/journal"
 	"github.com/filecoin-project/lotus/lib/blockstore"
 	"github.com/filecoin-project/lotus/markets"
@@ -584,7 +585,43 @@ func StorageProvider(minerAddress dtypes.MinerAddress,
 
 	opt := storageimpl.CustomDealDecisionLogic(storageimpl.DealDeciderFunc(df))
 
-	return storageimpl.NewProvider(net, namespace.Wrap(ds, datastore.NewKey("/deals/provider")), store, mds, pieceStore, dataTransfer, spn, address.Address(minerAddress), storedAsk, opt)
+	sp, err := storageimpl.NewProvider(net, namespace.Wrap(ds, datastore.NewKey("/deals/provider")), store, mds, pieceStore, dataTransfer, spn, address.Address(minerAddress), storedAsk, opt)
+
+	// TODO: store on disk
+	freebs := blockstore.NewTemporary()
+
+	sp.SubscribeToEvents(func(event storagemarket.ProviderEvent, deal storagemarket.MinerDeal) {
+		// When the deal is activated, copy the data to freeds
+		if event != storagemarket.ProviderEventDealActivated {
+			return
+		}
+
+		var ms *multistore.MultiStore = mds
+		s, err := ms.Get(*deal.StoreID)
+		if err != nil {
+			fmt.Println(fmt.Errorf("failed to get store %v from staging multistore: %w", *deal.StoreID, err))
+			return
+		}
+
+		ok, err := s.Bstore.Has(deal.Ref.Root)
+		if err != nil {
+			fmt.Println(fmt.Errorf("failed to determine if blockstore has deal root: %w", err))
+			return
+		}
+		if !ok {
+			fmt.Println(fmt.Errorf("missing deal root: %v", deal.Ref.Root))
+			return
+		}
+
+		// TODO: would need to support IPFS dag-PB as well as CBOR?
+		err = vm.Copy(context.TODO(), s.Bstore, freebs, deal.Ref.Root)
+		if err != nil {
+			fmt.Println(fmt.Errorf("failed to copy unsealed piece to free blockstore: %w", err))
+			return
+		}
+	})
+
+	return sp, err
 }
 
 func RetrievalDealFilter(userFilter dtypes.RetrievalDealFilter) func(onlineOk dtypes.ConsiderOnlineRetrievalDealsConfigFunc,
