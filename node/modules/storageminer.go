@@ -23,6 +23,7 @@ import (
 	graphsync "github.com/ipfs/go-graphsync/impl"
 	gsnet "github.com/ipfs/go-graphsync/network"
 	"github.com/ipfs/go-graphsync/storeutil"
+	format "github.com/ipfs/go-ipld-format"
 	"github.com/ipfs/go-merkledag"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/routing"
@@ -62,7 +63,6 @@ import (
 	"github.com/filecoin-project/lotus/chain/gen"
 	"github.com/filecoin-project/lotus/chain/gen/slashfilter"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/journal"
 	"github.com/filecoin-project/lotus/lib/blockstore"
 	"github.com/filecoin-project/lotus/markets"
@@ -567,10 +567,15 @@ func BasicDealFilter(user dtypes.StorageDealFilter) func(onlineOk dtypes.Conside
 	}
 }
 
-func StorageProvider(minerAddress dtypes.MinerAddress,
+func StorageProvider(
+	mctx helpers.MetricsCtx,
+	minerAddress dtypes.MinerAddress,
 	storedAsk *storedask.StoredAsk,
-	h host.Host, ds dtypes.MetadataDS,
+	h host.Host,
+	rt routing.Routing,
+	ds dtypes.MetadataDS,
 	mds dtypes.StagingMultiDstore,
+	ibs dtypes.StagingBlockstore,
 	r repo.LockedRepo,
 	pieceStore dtypes.ProviderPieceStore,
 	dataTransfer dtypes.ProviderDataTransfer,
@@ -588,40 +593,64 @@ func StorageProvider(minerAddress dtypes.MinerAddress,
 	sp, err := storageimpl.NewProvider(net, namespace.Wrap(ds, datastore.NewKey("/deals/provider")), store, mds, pieceStore, dataTransfer, spn, address.Address(minerAddress), storedAsk, opt)
 
 	// TODO: store on disk
-	freebs := blockstore.NewTemporary()
+	// TODO: can we just use the unsealed store?
+	fbs := blockstore.NewTemporary()
 
-	sp.SubscribeToEvents(func(event storagemarket.ProviderEvent, deal storagemarket.MinerDeal) {
-		// When the deal is activated, copy the data to freeds
-		if event != storagemarket.ProviderEventDealActivated {
-			return
-		}
+	bitswapNetwork := network.NewFromIpfsHost(h, rt)
+	bitswapOptions := []bitswap.Option{bitswap.ProvideEnabled(false)}
+	bitswap.New(mctx, bitswapNetwork, fbs, bitswapOptions...)
 
-		var ms *multistore.MultiStore = mds
-		s, err := ms.Get(*deal.StoreID)
-		if err != nil {
-			fmt.Println(fmt.Errorf("failed to get store %v from staging multistore: %w", *deal.StoreID, err))
-			return
-		}
-
-		ok, err := s.Bstore.Has(deal.Ref.Root)
-		if err != nil {
-			fmt.Println(fmt.Errorf("failed to determine if blockstore has deal root: %w", err))
-			return
-		}
-		if !ok {
-			fmt.Println(fmt.Errorf("missing deal root: %v", deal.Ref.Root))
-			return
-		}
-
-		// TODO: would need to support IPFS dag-PB as well as CBOR?
-		err = vm.Copy(context.TODO(), s.Bstore, freebs, deal.Ref.Root)
-		if err != nil {
-			fmt.Println(fmt.Errorf("failed to copy unsealed piece to free blockstore: %w", err))
-			return
-		}
-	})
+	// TODO: does not mean the deal succeeded
+	// TODO: brittle, there's no contract to say the data will be available in the mds store.
+	// TODO: unseal when deal is activated and then copy to fbs
+	sp.SubscribeToEvents(onProviderEventDataTransferCompleted(mctx, mds, fbs))
 
 	return sp, err
+}
+
+func onProviderEventDataTransferCompleted(ctx context.Context, mds *multistore.MultiStore, fbs blockstore.Blockstore) storagemarket.ProviderSubscriber {
+	return func(event storagemarket.ProviderEvent, deal storagemarket.MinerDeal) {
+		// When data for the deal is transferred, copy the data to free blockstore (fbs)
+		if event != storagemarket.ProviderEventDataTransferCompleted {
+			return
+		}
+
+		from, err := mds.Get(*deal.StoreID)
+		if err != nil {
+			log.Errorf("failed to get store %v: %v\n", *deal.StoreID, err)
+			return
+		}
+
+		err = copy(ctx, deal.Ref.Root, from.DAG, fbs)
+		if err != nil {
+			log.Errorf("failed to make %v available for bitswapping: %v\n", deal.Ref.Root, err)
+			return
+		}
+
+		log.Infof("now available to IPFS: %v\n", deal.Ref.Root)
+	}
+}
+
+// TODO: make not slow
+func copy(ctx context.Context, c cid.Cid, from format.NodeGetter, to blockstore.Blockstore) error {
+	node, err := from.Get(ctx, c)
+	if err != nil {
+		return fmt.Errorf("failed to read content to copy for CID %v: %v", c, err)
+	}
+
+	err = to.Put(node)
+	if err != nil {
+		return fmt.Errorf("failed to write copy for CID %v: %v", c, err)
+	}
+
+	for _, link := range node.Links() {
+		err = copy(ctx, link.Cid, from, to)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func RetrievalDealFilter(userFilter dtypes.RetrievalDealFilter) func(onlineOk dtypes.ConsiderOnlineRetrievalDealsConfigFunc,
@@ -671,7 +700,6 @@ func RetrievalProvider(h host.Host,
 	userFilter dtypes.RetrievalDealFilter,
 ) (retrievalmarket.RetrievalProvider, error) {
 	adapter := retrievaladapter.NewRetrievalProviderNode(miner, sealer, full)
-
 	maddr, err := minerAddrFromDS(ds)
 	if err != nil {
 		return nil, err
