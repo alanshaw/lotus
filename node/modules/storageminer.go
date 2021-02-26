@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,16 +25,17 @@ import (
 	graphsync "github.com/ipfs/go-graphsync/impl"
 	gsnet "github.com/ipfs/go-graphsync/network"
 	"github.com/ipfs/go-graphsync/storeutil"
-	format "github.com/ipfs/go-ipld-format"
 	"github.com/ipfs/go-merkledag"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/routing"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-commp-utils/pieceio/cario"
 	dtimpl "github.com/filecoin-project/go-data-transfer/impl"
 	dtnet "github.com/filecoin-project/go-data-transfer/network"
 	dtgstransport "github.com/filecoin-project/go-data-transfer/transport/graphsync"
 	piecefilestore "github.com/filecoin-project/go-fil-markets/filestore"
+	"github.com/filecoin-project/go-fil-markets/piecestore"
 	piecestoreimpl "github.com/filecoin-project/go-fil-markets/piecestore/impl"
 	"github.com/filecoin-project/go-fil-markets/retrievalmarket"
 	retrievalimpl "github.com/filecoin-project/go-fil-markets/retrievalmarket/impl"
@@ -53,6 +56,7 @@ import (
 	sectorstorage "github.com/filecoin-project/lotus/extern/sector-storage"
 	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
 	"github.com/filecoin-project/lotus/extern/sector-storage/stores"
+	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
 	sealing "github.com/filecoin-project/lotus/extern/storage-sealing"
 	"github.com/filecoin-project/lotus/extern/storage-sealing/sealiface"
 
@@ -74,6 +78,7 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/helpers"
 	"github.com/filecoin-project/lotus/node/repo"
 	"github.com/filecoin-project/lotus/storage"
+	specstorage "github.com/filecoin-project/specs-storage/storage"
 )
 
 var StorageCounterDSPrefix = "/storage/nextid"
@@ -569,7 +574,9 @@ func BasicDealFilter(user dtypes.StorageDealFilter) func(onlineOk dtypes.Conside
 
 func StorageProvider(
 	mctx helpers.MetricsCtx,
+	miner *storage.Miner,
 	minerAddress dtypes.MinerAddress,
+	minerID dtypes.MinerID,
 	storedAsk *storedask.StoredAsk,
 	h host.Host,
 	rt routing.Routing,
@@ -581,6 +588,7 @@ func StorageProvider(
 	dataTransfer dtypes.ProviderDataTransfer,
 	spn storagemarket.StorageProviderNode,
 	df dtypes.StorageDealFilter,
+	sealer sectorstorage.SectorManager,
 ) (storagemarket.StorageProvider, error) {
 	net := smnet.NewFromLibp2pHost(h)
 	store, err := piecefilestore.NewLocalFileStore(piecefilestore.OsPath(r.Path()))
@@ -591,6 +599,9 @@ func StorageProvider(
 	opt := storageimpl.CustomDealDecisionLogic(storageimpl.DealDeciderFunc(df))
 
 	sp, err := storageimpl.NewProvider(net, namespace.Wrap(ds, datastore.NewKey("/deals/provider")), store, mds, pieceStore, dataTransfer, spn, address.Address(minerAddress), storedAsk, opt)
+	if err != nil {
+		return nil, err
+	}
 
 	// TODO: store on disk
 	// TODO: can we just use the unsealed store?
@@ -600,57 +611,92 @@ func StorageProvider(
 	bitswapOptions := []bitswap.Option{bitswap.ProvideEnabled(false)}
 	bitswap.New(mctx, bitswapNetwork, fbs, bitswapOptions...)
 
-	// TODO: does not mean the deal succeeded
-	// TODO: brittle, there's no contract to say the data will be available in the mds store.
-	// TODO: unseal when deal is activated and then copy to fbs
-	sp.SubscribeToEvents(onProviderEventDataTransferCompleted(mctx, mds, fbs))
+	sp.SubscribeToEvents(onProviderEventDealActivated(mctx, miner, abi.ActorID(minerID), pieceStore, sealer, fbs))
 
 	return sp, err
 }
 
-func onProviderEventDataTransferCompleted(ctx context.Context, mds *multistore.MultiStore, fbs blockstore.Blockstore) storagemarket.ProviderSubscriber {
+// onProviderEventDealActivated copies the deal data to the free blockstore when
+// the deal is activated, effectively allowing it to be bitswapped by IPFS.
+func onProviderEventDealActivated(
+	ctx context.Context,
+	miner *storage.Miner,
+	minerID abi.ActorID,
+	pieceStore piecestore.PieceStore,
+	sealer sectorstorage.SectorManager,
+	fbs blockstore.Blockstore,
+) storagemarket.ProviderSubscriber {
 	return func(event storagemarket.ProviderEvent, deal storagemarket.MinerDeal) {
-		// When data for the deal is transferred, copy the data to free blockstore (fbs)
-		if event != storagemarket.ProviderEventDataTransferCompleted {
+		if event != storagemarket.ProviderEventDealActivated {
+			return
+		}
+		log.Debugf("DEAL ACTIVATED!: %v", deal.DealID)
+
+		si, err := miner.GetSectorInfo(deal.SectorNumber)
+		if err != nil {
+			log.Errorf("failed to get sector info for deal: %v sector: %v: %v", deal.DealID, deal.SectorNumber, err)
+			return
+		}
+		if si.CommD == nil {
+			log.Errorf("missing CommD for deal: %v sector: %v", deal.DealID, deal.SectorNumber)
 			return
 		}
 
-		from, err := mds.Get(*deal.StoreID)
+		ref := specstorage.SectorRef{
+			ID:        abi.SectorID{Miner: minerID, Number: deal.SectorNumber},
+			ProofType: si.SectorType,
+		}
+
+		cidInfo, err := pieceStore.GetCIDInfo(deal.Ref.Root)
 		if err != nil {
-			log.Errorf("failed to get store %v: %v\n", *deal.StoreID, err)
+			log.Errorf("getting CID info for deal: %v with root: %s: %v", deal.DealID, deal.Ref.Root, err)
 			return
 		}
 
-		err = copy(ctx, deal.Ref.Root, from.DAG, fbs)
-		if err != nil {
-			log.Errorf("failed to make %v available for bitswapping: %v\n", deal.Ref.Root, err)
+		var lastErr error
+		log.Debugf("deal root %v is in %d piece block locations", deal.Ref.Root, len(cidInfo.PieceBlockLocations))
+	OUTER:
+		for _, bl := range cidInfo.PieceBlockLocations {
+			pi, err := pieceStore.GetPieceInfo(bl.PieceCID)
+			if err != nil {
+				lastErr = fmt.Errorf("getting piece info: %v", err)
+				continue
+			}
+
+			log.Debugf("reading deals for piece: %v", pi.PieceCID)
+			for _, di := range pi.Deals {
+				log.Debugf("reading unsealed data in piece: %v", pi.PieceCID)
+
+				r, w := io.Pipe()
+				go func() {
+					err := sealer.ReadPiece(ctx, w, ref, storiface.UnpaddedByteIndex(di.Offset.Unpadded()), di.Length.Unpadded(), si.TicketValue, *si.CommD)
+					_ = w.CloseWithError(err)
+				}()
+
+				_, err := cario.NewCarIO().LoadCar(fbs, r)
+				// drain the reader first
+				_, derr := io.Copy(ioutil.Discard, r)
+
+				if err != nil {
+					lastErr = fmt.Errorf("reading piece: %v in deal: %v: %v", pi.PieceCID, di.DealID, err)
+					continue
+				}
+				if derr != nil {
+					lastErr = fmt.Errorf("draining reader for piece: %v in deal: %v: %v", pi.PieceCID, di.DealID, err)
+					continue
+				}
+				lastErr = nil
+				break OUTER
+			}
+		}
+
+		if lastErr != nil {
+			log.Errorf("exporting deal data to IPFS: %v", lastErr)
 			return
 		}
 
-		log.Infof("now available to IPFS: %v\n", deal.Ref.Root)
+		log.Infof("now available to IPFS: %v", deal.Ref.Root)
 	}
-}
-
-// TODO: make not slow
-func copy(ctx context.Context, c cid.Cid, from format.NodeGetter, to blockstore.Blockstore) error {
-	node, err := from.Get(ctx, c)
-	if err != nil {
-		return fmt.Errorf("failed to read content to copy for CID %v: %v", c, err)
-	}
-
-	err = to.Put(node)
-	if err != nil {
-		return fmt.Errorf("failed to write copy for CID %v: %v", c, err)
-	}
-
-	for _, link := range node.Links() {
-		err = copy(ctx, link.Cid, from, to)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func RetrievalDealFilter(userFilter dtypes.RetrievalDealFilter) func(onlineOk dtypes.ConsiderOnlineRetrievalDealsConfigFunc,
