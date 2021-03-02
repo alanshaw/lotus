@@ -584,7 +584,6 @@ func StorageProvider(
 	rt routing.Routing,
 	ds dtypes.MetadataDS,
 	mds dtypes.StagingMultiDstore,
-	ibs dtypes.StagingBlockstore,
 	r repo.LockedRepo,
 	pieceStore dtypes.ProviderPieceStore,
 	dataTransfer dtypes.ProviderDataTransfer,
