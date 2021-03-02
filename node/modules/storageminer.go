@@ -49,6 +49,7 @@ import (
 	"github.com/filecoin-project/go-multistore"
 	paramfetch "github.com/filecoin-project/go-paramfetch"
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-statestore"
 	"github.com/filecoin-project/go-storedcounter"
 
@@ -573,6 +574,7 @@ func BasicDealFilter(user dtypes.StorageDealFilter) func(onlineOk dtypes.Conside
 }
 
 func StorageProvider(
+	lc fx.Lifecycle,
 	mctx helpers.MetricsCtx,
 	miner *storage.Miner,
 	minerAddress dtypes.MinerAddress,
@@ -589,6 +591,7 @@ func StorageProvider(
 	spn storagemarket.StorageProviderNode,
 	df dtypes.StorageDealFilter,
 	sealer sectorstorage.SectorManager,
+	rp retrievalmarket.RetrievalProvider,
 ) (storagemarket.StorageProvider, error) {
 	net := smnet.NewFromLibp2pHost(h)
 	store, err := piecefilestore.NewLocalFileStore(piecefilestore.OsPath(r.Path()))
@@ -603,15 +606,20 @@ func StorageProvider(
 		return nil, err
 	}
 
-	// TODO: store on disk
+	ctx := helpers.LifecycleCtx(mctx, lc)
+	fds, err := r.Datastore(ctx, "/free")
+	if err != nil {
+		return nil, err
+	}
+
 	// TODO: can we just use the unsealed store?
-	fbs := blockstore.NewTemporary()
+	fbs := blockstore.NewBlockstore(fds)
 
 	bitswapNetwork := network.NewFromIpfsHost(h, rt)
 	bitswapOptions := []bitswap.Option{bitswap.ProvideEnabled(false)}
 	bitswap.New(mctx, bitswapNetwork, fbs, bitswapOptions...)
 
-	sp.SubscribeToEvents(onProviderEventDealActivated(mctx, miner, abi.ActorID(minerID), pieceStore, sealer, fbs))
+	sp.SubscribeToEvents(onProviderEventDealActivated(mctx, miner, abi.ActorID(minerID), pieceStore, sealer, rp, fbs))
 
 	return sp, err
 }
@@ -624,6 +632,7 @@ func onProviderEventDealActivated(
 	minerID abi.ActorID,
 	pieceStore piecestore.PieceStore,
 	sealer sectorstorage.SectorManager,
+	rp retrievalmarket.RetrievalProvider,
 	fbs blockstore.Blockstore,
 ) storagemarket.ProviderSubscriber {
 	return func(event storagemarket.ProviderEvent, deal storagemarket.MinerDeal) {
@@ -631,6 +640,12 @@ func onProviderEventDealActivated(
 			return
 		}
 		log.Debugf("DEAL ACTIVATED!: %v", deal.DealID)
+
+		ask := rp.GetAsk()
+		if !ask.PricePerByte.Equals(big.Zero()) || !ask.UnsealPrice.Equals(big.Zero()) {
+			log.Debugf("skipping non-free retrieval deal: %+v", ask)
+			return
+		}
 
 		si, err := miner.GetSectorInfo(deal.SectorNumber)
 		if err != nil {
